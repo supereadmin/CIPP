@@ -3,20 +3,17 @@ name: Azure Static Web Apps CI/CD (remove tenant fragment & skip auto-build)
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
   # pull_request:
   #   types: [opened, synchronize, reopened, closed]
-  #   branches:
-  #     - main
-  #     - master
+  #   branches: [ main, master ]
 
 jobs:
   build_and_deploy_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     name: Build and Deploy Job
+
     steps:
       - uses: actions/checkout@v3
         with:
@@ -31,31 +28,82 @@ jobs:
         run: |
           npm ci
           npm run build
+          echo "---- contents of ./out (top level) ----"
+          ls -la out || true
+          # Fail fast if ./out doesn't exist or doesn't contain an index.html
+          test -d out || (echo "❌ No ./out folder produced by build" && exit 1)
+          test -f out/index.html || echo "⚠️ No out/index.html (may be SPA framework-specific)"
 
-      - name: Remove #@Go fragment from links
+      # 🔧 Patch ALL 'go' tenant-hint variants (static & dynamic)
+      - name: Remove all 'go' tenant hints from links
         run: |
-          echo "Scanning for 'https://portal.azure.com/#@Go/' in ./out..."
-          grep -R "https://portal.azure.com/#@Go/" -n out || true
+          set -e
+          echo "Scanning ./out before patch..."
+          grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" out || true
 
+          # 1) Fully qualified scheme + fragment
           find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
-          | xargs -0 sed -i "s|https://portal.azure.com/#@Go/|https://portal.azure.com/|g"
+            | xargs -0 sed -i "s|https://portal.azure.com/#@Go/|https://portal.azure.com/|g"
 
-          echo "Verifying removal…"
-          if grep -R "https://portal.azure.com/#@Go/" -n out; then
-            echo "❌ Fragment still present"; exit 1
+          # 2) Fragment-only forms (with/without trailing slash)
+          find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
+            | xargs -0 sed -i -E "s|#@Go(/)?|/|g"
+
+          # 3) URL-encoded '@' variants in fragments
+          find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
+            | xargs -0 sed -i -E "s|#%40Go(/)?|/|g"
+
+          # 4) Query-parameter style tenant hints
+          find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
+            | xargs -0 sed -i -E "s|([?&])(tenant|tid)=go(&|$)|\1|g"
+
+          echo "Verifying after patch..."
+          if grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" out; then
+            echo "❌ A 'go' tenant hint survived in the bundle."; exit 1
           else
-            echo "✅ Fragment removed"
+            echo "✅ All 'go' tenant hints removed."
           fi
 
+      # 🛡️ Runtime safety-net: sanitize Azure Portal links at click time
+      - name: Inject runtime sanitizer into index.html (defense-in-depth)
+        run: |
+          cat > sanitizer.js <<'EOF'
+          (function () {
+            document.addEventListener('click', function (ev) {
+              const a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+              if (!a || !a.href) return;
+              if (!/https:\/\/portal\.azure\.com/.test(a.href)) return;
+
+              // Strip known-bad tenant hints in fragment or query string
+              let href = a.href
+                .replace(/#@Go\/?/gi, '/')     // '#@Go' or '#@Go/'
+                .replace(/#%40Go\/?/gi, '/')    // URL-encoded '@'
+                .replace(/([?&])(tenant|tid)=go(&|$)/gi, '$1'); // query param form
+
+              if (href !== a.href) a.href = href;
+            }, true);
+          }());
+          EOF
+
+          if [ -f out/index.html ]; then
+            # Inject before closing </body>
+            sed -i '/<\/body>/i <script>'"$(sed -e 's/[&/\]/\\&/g' sanitizer.js)"'</script>' out/index.html
+            echo "✅ Sanitizer injected into out/index.html"
+          else
+            echo "ℹ️ out/index.html not found; skipping inline injection (app may mount index elsewhere)."
+          fi
+          rm -f sanitizer.js
+
+      # 🚀 Deploy prebuilt & patched ./out (NO auto-build)
       - name: Deploy to Azure Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
           azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }}
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: "upload"
-          app_location: "out"
-          output_location: ""
-          skip_app_build: true
+          app_location: "out"     # when skip_app_build=true, this is the build output folder
+          output_location: ""     # not used with skip_app_build
+          skip_app_build: true    # do not let Oryx rebuild and undo our patch
           skip_api_build: true
 
   close_pull_request_job:
