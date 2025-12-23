@@ -4,15 +4,11 @@ name: Azure Static Web Apps CI/CD (remove tenant fragment & skip auto-build)
 on:
   push:
     branches: [ main, master ]
-  # pull_request:
-  #   types: [opened, synchronize, reopened, closed]
-  #   branches: [ main, master ]
 
 jobs:
   build_and_deploy_job:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
-    name: Build and Deploy Job
+    name: Build and Deploy (pre-patch + post-patch + runtime fix)
 
     steps:
       - uses: actions/checkout@v3
@@ -24,24 +20,46 @@ jobs:
         with:
           node-version: '18'
 
+      # 🔧 Pre-build patch: remove ALL 'go' tenant-hint variants in source (static & dynamic)
+      - name: Pre-build: scrub repo source for 'go' tenant hints
+        run: |
+          echo "Scanning source for bad tenant hints..."
+          grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" . || true
+
+          # Replace fragment forms
+          find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.html' -o -name '*.json' \) -print0 \
+            | xargs -0 sed -i -E "s|#@Go(/)?|/|g"
+
+          find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.html' -o -name '*.json' \) -print0 \
+            | xargs -0 sed -i -E "s|#%40Go(/)?|/|g"
+
+          # Replace query-parameter forms
+          find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' -o -name '*.html' -o -name '*.json' \) -print0 \
+            | xargs -0 sed -i -E "s|([?&])(tenant|tid)=go(&|$)|\1|g"
+
+          echo "Verifying source..."
+          if grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" .; then
+            echo "⚠️ Some occurrences remain in non-text files (ok, we also patch bundle later)"
+          else
+            echo "✅ Source scrubbed"
+          fi
+
       - name: Install & Build (to ./out)
         run: |
           npm ci
           npm run build
-          echo "---- contents of ./out (top level) ----"
+          echo "---- contents of ./out ----"
           ls -la out || true
-          # Fail fast if ./out doesn't exist or doesn't contain an index.html
-          test -d out || (echo "❌ No ./out folder produced by build" && exit 1)
-          test -f out/index.html || echo "⚠️ No out/index.html (may be SPA framework-specific)"
+          test -d out || (echo "❌ Build did not produce ./out"; exit 1)
 
-      # 🔧 Patch ALL 'go' tenant-hint variants (static & dynamic)
-      - name: Remove all 'go' tenant hints from links
+      # 🔧 Post-build patch: scrub ALL variants in built bundle
+      - name: Post-build: scrub built bundle for 'go' tenant hints
         run: |
           set -e
           echo "Scanning ./out before patch..."
           grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" out || true
 
-          # 1) Fully qualified scheme + fragment
+          # 1) Fully-qualified scheme + fragment
           find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
             | xargs -0 sed -i "s|https://portal.azure.com/#@Go/|https://portal.azure.com/|g"
 
@@ -57,15 +75,15 @@ jobs:
           find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
             | xargs -0 sed -i -E "s|([?&])(tenant|tid)=go(&|$)|\1|g"
 
-          echo "Verifying after patch..."
+          echo "Verifying bundle..."
           if grep -R --line-number -E "#@Go|#%40Go|tenant=go|tid=go" out; then
-            echo "❌ A 'go' tenant hint survived in the bundle."; exit 1
+            echo "❌ A 'go' tenant hint survived in bundle"; exit 1
           else
-            echo "✅ All 'go' tenant hints removed."
+            echo "✅ Bundle scrubbed"
           fi
 
       # 🛡️ Runtime safety-net: sanitize Azure Portal links at click time
-      - name: Inject runtime sanitizer into index.html (defense-in-depth)
+      - name: Inject runtime sanitizer into index.html
         run: |
           cat > sanitizer.js <<'EOF'
           (function () {
@@ -74,11 +92,10 @@ jobs:
               if (!a || !a.href) return;
               if (!/https:\/\/portal\.azure\.com/.test(a.href)) return;
 
-              // Strip known-bad tenant hints in fragment or query string
               let href = a.href
-                .replace(/#@Go\/?/gi, '/')     // '#@Go' or '#@Go/'
-                .replace(/#%40Go\/?/gi, '/')    // URL-encoded '@'
-                .replace(/([?&])(tenant|tid)=go(&|$)/gi, '$1'); // query param form
+                .replace(/#@Go\/?/gi, '/')
+                .replace(/#%40Go\/?/gi, '/')
+                .replace(/([?&])(tenant|tid)=go(&|$)/gi, '$1');
 
               if (href !== a.href) a.href = href;
             }, true);
@@ -86,15 +103,14 @@ jobs:
           EOF
 
           if [ -f out/index.html ]; then
-            # Inject before closing </body>
             sed -i '/<\/body>/i <script>'"$(sed -e 's/[&/\]/\\&/g' sanitizer.js)"'</script>' out/index.html
             echo "✅ Sanitizer injected into out/index.html"
           else
-            echo "ℹ️ out/index.html not found; skipping inline injection (app may mount index elsewhere)."
+            echo "ℹ️ out/index.html not found; skipping inline injection (framework-specific)"
           fi
           rm -f sanitizer.js
 
-      # 🚀 Deploy prebuilt & patched ./out (NO auto-build)
+      # 🚀 Deploy the **patched** out/ as-is (no auto-build)
       - name: Deploy to Azure Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
@@ -105,14 +121,3 @@ jobs:
           output_location: ""     # not used with skip_app_build
           skip_app_build: true    # do not let Oryx rebuild and undo our patch
           skip_api_build: true
-
-  close_pull_request_job:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    name: Close Pull Request Job
-    steps:
-      - name: Close Pull Request
-        uses: Azure/static-web-apps-deploy@v1
-        with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }}
-          action: "close"
