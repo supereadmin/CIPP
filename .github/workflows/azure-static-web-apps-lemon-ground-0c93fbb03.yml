@@ -1,15 +1,16 @@
-name: Azure Static Web Apps CI/CD
+
+name: Azure Static Web Apps CI/CD (remove tenant fragment & skip auto-build)
 
 on:
   push:
     branches:
       - main
       - master
-#  pull_request:
-#    types: [opened, synchronize, reopened, closed]
-#    branches:
-#      - main
-      - master
+  # pull_request:
+  #   types: [opened, synchronize, reopened, closed]
+  #   branches:
+  #     - main
+  #     - master
 
 jobs:
   build_and_deploy_job:
@@ -17,22 +18,45 @@ jobs:
     runs-on: ubuntu-latest
     name: Build and Deploy Job
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: true
-      - name: Build And Deploy
-        id: builddeploy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install & Build (to ./out)
+        run: |
+          npm ci
+          npm run build
+
+      - name: Remove #@Go fragment from links
+        run: |
+          echo "Scanning for 'https://portal.azure.com/#@Go/' in ./out..."
+          grep -R "https://portal.azure.com/#@Go/" -n out || true
+
+          find out -type f \( -name '*.html' -o -name '*.js' -o -name '*.json' -o -name '*.css' \) -print0 \
+          | xargs -0 sed -i "s|https://portal.azure.com/#@Go/|https://portal.azure.com/|g"
+
+          echo "Verifying removal…"
+          if grep -R "https://portal.azure.com/#@Go/" -n out; then
+            echo "❌ Fragment still present"; exit 1
+          else
+            echo "✅ Fragment removed"
+          fi
+
+      - name: Deploy to Azure Static Web Apps
         uses: Azure/static-web-apps-deploy@v1
         with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }} # change this to your repository secret name
-          repo_token: ${{ secrets.GITHUB_TOKEN }} # Used for Github integrations (i.e. PR comments)
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
           action: "upload"
-          ###### Repository/Build Configurations - These values can be configured to match your app requirements. ######
-          # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
-          app_location: "/" # App source code path
-          api_location: "" # Api source code path - optional
-          output_location: "/out" # Built app content directory - optional
-          ###### End of Repository/Build Configurations ######
+          app_location: "out"
+          output_location: ""
+          skip_app_build: true
+          skip_api_build: true
 
   close_pull_request_job:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
@@ -40,8 +64,7 @@ jobs:
     name: Close Pull Request Job
     steps:
       - name: Close Pull Request
-        id: closepullrequest
         uses: Azure/static-web-apps-deploy@v1
         with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }} # change this to your repository secret name
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_LEMON_GROUND_0C93FBB03 }}
           action: "close"
